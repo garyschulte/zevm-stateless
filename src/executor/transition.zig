@@ -841,9 +841,10 @@ pub fn transitionWithContext(
         // 3b. Pre-validate sender state — zevm's ExecuteEvm.execute() swallows
         // validation errors and returns Fail(0 gas). To correctly classify
         // invalid txs as "rejected" (vs failed-execution with a receipt), we
-        // pre-check nonce and balance here against the current journal state.
+        // pre-check nonce, balance, EIP-3607, and base fee here.
         {
-            const sender_load = ctx.journaled_state.loadAccount(sender) catch |err| {
+            // Load with code so we can check EIP-3607 delegation exception.
+            const sender_load = ctx.journaled_state.loadAccountMutOptionalCode(sender, true, false) catch |err| {
                 ctx.journaled_state.discardTx();
                 if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
                 ctx.tx.data = null;
@@ -854,7 +855,26 @@ pub fn transitionWithContext(
                 ctx.tx.authorization_list = null;
                 return err;
             };
-            const sender_info = sender_load.data.info;
+            const sender_info = sender_load.data.account.info;
+
+            // EIP-3607: reject txs from senders with deployed code (unless EIP-7702 delegation).
+            if (!ctx.cfg.disable_eip3607) {
+                if (!std.mem.eql(u8, &sender_info.code_hash, &primitives.KECCAK_EMPTY)) {
+                    const is_delegation = if (sender_info.code) |code| code.isEip7702() else false;
+                    if (!is_delegation) {
+                        ctx.journaled_state.discardTx();
+                        if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
+                        ctx.tx.data = null;
+                        ctx.tx.access_list.deinit();
+                        if (ctx.tx.blob_hashes) |*bh| bh.deinit(alloc_mod.get());
+                        ctx.tx.blob_hashes = null;
+                        if (ctx.tx.authorization_list) |*al| al.deinit(alloc_mod.get());
+                        ctx.tx.authorization_list = null;
+                        return error.SenderHasCode;
+                    }
+                }
+            }
+
             const tx_nonce = tx.nonce orelse 0;
             if (sender_info.nonce != tx_nonce) {
                 ctx.journaled_state.discardTx();
@@ -867,8 +887,38 @@ pub fn transitionWithContext(
                 ctx.tx.authorization_list = null;
                 return if (sender_info.nonce > tx_nonce) error.NonceMismatch else error.NonceMismatchTooHigh;
             }
-            const egp_check = effectiveGasPrice(tx, env.base_fee orelse 0);
-            const max_gas_fee: u256 = @as(u256, tx.gas) * @as(u256, egp_check);
+
+            // EIP-2681: CREATE is invalid when sender nonce == maxInt(u64) (would overflow on increment).
+            if (tx.to == null and sender_info.nonce == std.math.maxInt(u64)) {
+                ctx.journaled_state.discardTx();
+                if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
+                ctx.tx.data = null;
+                ctx.tx.access_list.deinit();
+                if (ctx.tx.blob_hashes) |*bh| bh.deinit(alloc_mod.get());
+                ctx.tx.blob_hashes = null;
+                if (ctx.tx.authorization_list) |*al| al.deinit(alloc_mod.get());
+                ctx.tx.authorization_list = null;
+                return error.NonceIsMax;
+            }
+
+            // Base fee check (EIP-1559): gas_price (= maxFeePerGas for type 2/3/4) must cover basefee.
+            if (!ctx.cfg.disable_base_fee) {
+                if (ctx.tx.gas_price < ctx.block.basefee) {
+                    ctx.journaled_state.discardTx();
+                    if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
+                    ctx.tx.data = null;
+                    ctx.tx.access_list.deinit();
+                    if (ctx.tx.blob_hashes) |*bh| bh.deinit(alloc_mod.get());
+                    ctx.tx.blob_hashes = null;
+                    if (ctx.tx.authorization_list) |*al| al.deinit(alloc_mod.get());
+                    ctx.tx.authorization_list = null;
+                    return error.GasPriceLessThanBaseFee;
+                }
+            }
+
+            // Use worst-case max gas price (maxFeePerGas for EIP-1559, gasPrice for legacy).
+            // ctx.tx.gas_price is already set to maxFeePerGas for type 2/3/4.
+            const max_gas_fee: u256 = @as(u256, tx.gas) * @as(u256, ctx.tx.gas_price);
             const blob_cost: u256 = if (tx.type == 3) blk: {
                 const n: u256 = tx.blob_versioned_hashes.len;
                 const max_blob_fee: u256 = tx.max_fee_per_blob_gas orelse 0;
@@ -913,6 +963,45 @@ pub fn transitionWithContext(
             var frame_stack_pre = handler_mod.FrameStack.new();
             var evm_pre = handler_mod.EvmFor(@TypeOf(ctx.*).DatabaseType).init(ctx, null, &instructions, &precompiles, &frame_stack_pre);
             _ = handler_mod.Validation.validateInitialTxGas(&evm_pre) catch |err| {
+                ctx.journaled_state.discardTx();
+                if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
+                ctx.tx.data = null;
+                ctx.tx.access_list.deinit();
+                if (ctx.tx.blob_hashes) |*bh| bh.deinit(alloc_mod.get());
+                ctx.tx.blob_hashes = null;
+                if (ctx.tx.authorization_list) |*al| al.deinit(alloc_mod.get());
+                ctx.tx.authorization_list = null;
+                return err;
+            };
+
+            // Stateless env checks: priority fee > max fee, chain ID, gas limit cap.
+            handler_mod.Validation.validateEnv(&evm_pre) catch |err| {
+                ctx.journaled_state.discardTx();
+                if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
+                ctx.tx.data = null;
+                ctx.tx.access_list.deinit();
+                if (ctx.tx.blob_hashes) |*bh| bh.deinit(alloc_mod.get());
+                ctx.tx.blob_hashes = null;
+                if (ctx.tx.authorization_list) |*al| al.deinit(alloc_mod.get());
+                ctx.tx.authorization_list = null;
+                return err;
+            };
+
+            // Blob tx validation: versioned hash, empty list, create restriction, gas price.
+            handler_mod.Validation.validateBlobTx(&ctx.tx, &ctx.block, spec) catch |err| {
+                ctx.journaled_state.discardTx();
+                if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
+                ctx.tx.data = null;
+                ctx.tx.access_list.deinit();
+                if (ctx.tx.blob_hashes) |*bh| bh.deinit(alloc_mod.get());
+                ctx.tx.blob_hashes = null;
+                if (ctx.tx.authorization_list) |*al| al.deinit(alloc_mod.get());
+                ctx.tx.authorization_list = null;
+                return err;
+            };
+
+            // EIP-7702 type-4 validation: no CREATE, non-empty auth list.
+            handler_mod.Validation.validateEip7702Tx(&ctx.tx, spec) catch |err| {
                 ctx.journaled_state.discardTx();
                 if (ctx.tx.data) |*d| d.deinit(alloc_mod.get());
                 ctx.tx.data = null;

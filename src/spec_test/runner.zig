@@ -432,6 +432,9 @@ pub fn runFixture(
                     else => continue,
                 };
 
+                // Whether this post entry expects the transaction to be invalid.
+                const expect_exception = post_entry.get("expectException") != null;
+
                 // Expected hashes
                 const exp_hash_str = jStr(post_entry.get("hash") orelse continue) orelse continue;
                 const exp_logs_str = jStr(post_entry.get("logs") orelse continue) orelse continue;
@@ -506,16 +509,34 @@ pub fn runFixture(
                     chain_id,
                     -1, // no mining reward in state tests (avoids spurious coinbase touch)
                 ) catch |err| {
-                    stats.failed += 1;
-                    std.debug.print("FAIL  {s}  {s}  {s}[{}]  (transition: {})\n", .{
-                        rel_path, test_name, fork, post_idx, err,
-                    });
-                    if (stop_on_fail) return false;
+                    if (expect_exception) {
+                        stats.passed += 1;
+                        if (!quiet) {
+                            std.debug.print("PASS  {s}  {s}  {s}[{}]\n", .{
+                                rel_path, test_name, fork, post_idx,
+                            });
+                        }
+                    } else {
+                        stats.failed += 1;
+                        std.debug.print("FAIL  {s}  {s}  {s}[{}]  (transition: {})\n", .{
+                            rel_path, test_name, fork, post_idx, err,
+                        });
+                        if (stop_on_fail) return false;
+                    }
                     continue;
                 };
 
                 const got_state = output_mod.computeStateRoot(ca, result.alloc, &.{}) catch [_]u8{0} ** 32;
                 const got_logs = output_mod.computeLogsHash(ca, result.receipts) catch [_]u8{0} ** 32;
+
+                if (expect_exception) {
+                    stats.failed += 1;
+                    std.debug.print("FAIL  {s}  {s}  {s}[{}]  (expected exception, but transition succeeded)\n", .{
+                        rel_path, test_name, fork, post_idx,
+                    });
+                    if (stop_on_fail) return false;
+                    continue;
+                }
 
                 if (std.mem.eql(u8, &got_state, &exp_hash) and
                     std.mem.eql(u8, &got_logs, &exp_logs))

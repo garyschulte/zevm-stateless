@@ -259,6 +259,10 @@ pub fn parseEnv(alloc: std.mem.Allocator, json_text: []const u8) !Env {
         }
     }
 
+    // Amsterdam+: beacon chain slot number
+    if (obj.get("slotNumber") orelse obj.get("currentSlotNumber")) |v|
+        env.slot_number = jsonU64(v) catch null;
+
     // withdrawals (Shanghai+)
     if (obj.get("withdrawals")) |wv| {
         if (wv == .array) {
